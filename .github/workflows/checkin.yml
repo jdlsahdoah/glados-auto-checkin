@@ -1,43 +1,259 @@
-# GLaDOS automatic check-in via GitHub Actions
-#
-# Schedule times are UTC. Beijing time (UTC+8) equivalents:
-#   - 23:15 UTC → 07:15 北京时间（次日凌晨前一天的 UTC 对应早上签到）
-#   - 07:15 UTC → 15:15 北京时间
-#
-# GitHub may delay or skip schedule triggers on inactive forks.
-# Use workflow_dispatch for manual runs, or an external cron that POSTs
-# to the workflow_dispatch API if you need more reliable timing.
-
 name: GLaDOS Check-in
 
 on:
   schedule:
-    # 07:15 Beijing (UTC+8) = 23:15 UTC
-    - cron: "15 23 * * *"
-    # 15:15 Beijing (UTC+8) = 07:15 UTC
-    - cron: "15 7 * * *"
+    - cron: '15 23 * * *' # 07:15 UTC+8
+    - cron: '15 7 * * *' # 15:15 UTC+8
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: glados-checkin
+  cancel-in-progress: false
+
 jobs:
   checkin:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
-          # Pin current Node.js LTS major version (not a floating alias).
           node-version: 24
+
+      - name: Set up Chrome driver
+        run: |
+          google-chrome --version
+          if ! command -v xvfb-run >/dev/null || ! command -v xauth >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y xvfb xauth
+          fi
+          npm install --no-audit --no-fund --ignore-scripts --no-package-lock --no-save playwright@1.65.1
 
       - name: Run GLaDOS check-in
         env:
-          # Repository Secret — never echo or print this value.
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
-        run: node cli/checkin.js
+        shell: bash
+        run: |
+          xvfb-run -a node <<'NODE'
+          'use strict';
+
+          const { spawn } = require('node:child_process');
+          const { mkdtemp, readFile, rm } = require('node:fs/promises');
+          const { tmpdir } = require('node:os');
+          const { join } = require('node:path');
+          const { setTimeout: sleep } = require('node:timers/promises');
+          const { chromium } = require('playwright');
+          const { GLADOS_ORIGINS, parseAccounts } = require('./lib/glados-core');
+
+          const STATUS = '/api/user/status';
+          const CHECKIN = '/api/user/checkin';
+          const CHALLENGE = `${CHECKIN}/challenge`;
+
+          async function connectToChrome(profile, chrome) {
+            let spawnFailed = false;
+            chrome.once('error', () => { spawnFailed = true; });
+            for (let attempt = 0; attempt < 60; attempt += 1) {
+              if (spawnFailed || chrome.exitCode !== null) break;
+              const portFile = await readFile(join(profile, 'DevToolsActivePort'), 'utf8').catch(() => '');
+              const port = Number(portFile.split('\n', 1)[0]);
+              if (Number.isInteger(port) && port > 0 && port <= 65535) {
+                return chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 10000 });
+              }
+              await sleep(250);
+            }
+            throw new Error('Chrome did not start');
+          }
+
+          function browserCookies(account, origin) {
+            return account.cookie.split(';').filter((part) => part.trim()).map((part) => {
+              const separator = part.indexOf('=');
+              const name = part.slice(0, separator).trim();
+              if (separator < 1 || !name) throw new Error('Invalid cookie field');
+              return {
+                name,
+                value: part.slice(separator + 1).trim(),
+                url: `${origin}/`,
+                secure: true,
+                httpOnly: /(?:^|:)sess(?:\.sig)?$/i.test(name),
+              };
+            });
+          }
+
+          // Count only outcomes explicitly reported by the check-in service.
+          function checkinOutcome(result) {
+            const code = String(result?.code ?? '');
+            const message = typeof result?.message === 'string' ? result.message : '';
+            if (code === '5' || result?.reason === 'turnstile') {
+              return ['failed', 'Cloudflare 验证被拒绝'];
+            }
+            if (code === '-2' || code === '4') {
+              return ['failed', '登录状态或设备验证被拒绝'];
+            }
+            if ((code === '0' || code === '1') && /today.s observation logged/i.test(message)) {
+              return ['recorded', '今日记录已存在，新增积分待核对'];
+            }
+            if ((code === '0' || code === '1') && /already checked\s*-?\s*in|checkin repeats?|已签到|重复签到/i.test(message)) {
+              return ['already', '今日已签到'];
+            }
+            if (code === '0') {
+              const reward = message.match(/^Check\s*-?\s*in!\s*Got\s+(\d+(?:\.\d+)?)\s+Points?\b/i);
+              if (reward) return ['new', `签到成功，获得 ${reward[1]} 积分`];
+              if (/^(?:check\s*-?\s*in!|签到成功[！!]?)[\s。]*$/i.test(message.trim())) {
+                return ['new', '签到成功'];
+              }
+            }
+            return ['failed', '官网未返回可确认的签到结果，请核对签到记录'];
+          }
+
+          function matches(response, origin, method, path) {
+            const url = new URL(response.url());
+            return url.origin === origin && url.pathname === path && response.request().method() === method;
+          }
+
+          async function checkAccount(browser, account, seen) {
+            // Both configured accounts use glados.cloud. Explicit per-account origins are also supported.
+            const origin = account.origin || GLADOS_ORIGINS[0];
+            const context = await browser.newContext({ serviceWorkers: 'block' });
+            let requiresVerification = false;
+            let armed = false;
+            let submitted = false;
+            let failure = '无法读取浏览器中的登录状态';
+            try {
+              await context.addCookies(browserCookies(account, origin));
+              await context.route('**/*', async (route) => {
+                const request = route.request();
+                const url = new URL(request.url());
+                const method = request.method();
+                const sameSite = url.origin === origin;
+
+                if (url.protocol === 'https:' && (
+                  ['GET', 'HEAD', 'OPTIONS'].includes(method) ||
+                  url.hostname === 'challenges.cloudflare.com' ||
+                  (sameSite && url.pathname.startsWith('/cdn-cgi/challenge-platform/'))
+                )) {
+                  return route.continue();
+                }
+                if (sameSite && method === 'POST' && url.pathname === CHECKIN && armed && !submitted) {
+                  let body;
+                  try {
+                    body = request.postDataJSON();
+                  } catch {
+                    return route.abort();
+                  }
+                  if (body?.nonce && body?.proof && (!requiresVerification || (body.turnstile && body.tsState === 'ok'))) {
+                    submitted = true;
+                    return route.continue();
+                  }
+                }
+                return route.abort();
+              });
+
+              const page = await context.newPage();
+              const statusResponse = await page.goto(`${origin}${STATUS}`, { timeout: 15000 });
+              if (!statusResponse?.ok() || !matches(statusResponse, origin, 'GET', STATUS)) {
+                return ['failed', '登录状态查询失败'];
+              }
+              const status = await statusResponse.json();
+              const identity = typeof status?.data?.email === 'string' ? status.data.email.trim().toLowerCase() : '';
+              if (String(status?.code) !== '0' || !identity) return ['failed', '无法确认已登录的账号'];
+              if (seen.has(identity)) return ['failed', '这条登录记录与之前的账号相同'];
+              seen.add(identity);
+
+              failure = '官网签到页未就绪';
+              const [challengeResponse] = await Promise.all([
+                page.waitForResponse((response) => matches(response, origin, 'GET', CHALLENGE), { timeout: 30000 }),
+                page.goto(`${origin}/console/checkin`, { waitUntil: 'domcontentloaded', timeout: 30000 }),
+              ]);
+              const challenge = await challengeResponse.json();
+              if (!challengeResponse.ok() || String(challenge?.code) !== '0' || !challenge.nonce) {
+                return ['failed', '官网没有提供有效的签到验证'];
+              }
+              const button = page.locator('button.ckb').or(
+                page.getByRole('button', { name: /^(?:check[\s-]*in|签到|簽到)$/i }),
+              ).first();
+              await button.waitFor({ state: 'visible', timeout: 15000 });
+              await button.scrollIntoViewIfNeeded();
+
+              requiresVerification = Boolean(challenge.turnstile);
+              if (requiresVerification) {
+                failure = 'Cloudflare 验证未自动通过，需要手动确认';
+                // Wait for the official widget. Never click or solve its challenge.
+                await page.waitForFunction(() => {
+                  try {
+                    if (window.turnstile?.getResponse()) return true;
+                  } catch { /* The widget may still be initializing. */ }
+                  return [...document.querySelectorAll('input[name="cf-turnstile-response"]')]
+                    .some((input) => input.value.length > 0);
+                }, null, { timeout: 45000 });
+              }
+
+              failure = '官网签到请求未完成';
+              armed = true;
+              const [response] = await Promise.all([
+                page.waitForResponse((result) => matches(result, origin, 'POST', CHECKIN), { timeout: 30000 }),
+                button.click({ timeout: 10000 }),
+              ]);
+              if (!response.ok()) return ['failed', '官网签到接口拒绝了请求'];
+              return checkinOutcome(await response.json());
+            } catch {
+              return ['failed', submitted ? '签到已提交，结果未确认，请核对官网记录' : failure];
+            } finally {
+              await context.close().catch(() => {});
+            }
+          }
+
+          async function main() {
+            const secret = process.env.GLADOS_COOKIE;
+            delete process.env.GLADOS_COOKIE;
+            let accounts;
+            try {
+              accounts = parseAccounts(secret);
+            } catch {
+              console.error('无法读取 GLADOS_COOKIE，请检查密钥是否已设置、每个账号是否单独一行。');
+              process.exitCode = 1;
+              return;
+            }
+            if (accounts.length !== 2) {
+              console.error(`需要两条账号登录记录，实际读取 ${accounts.length} 条。`);
+              process.exitCode = 1;
+              return;
+            }
+
+            const profile = await mkdtemp(join(tmpdir(), 'glados-chrome-'));
+            const chrome = spawn('google-chrome', [
+              `--user-data-dir=${profile}`, '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
+              '--no-first-run', '--no-default-browser-check', 'about:blank',
+            ], { stdio: 'ignore' });
+            let browser;
+            try {
+              browser = await connectToChrome(profile, chrome);
+              console.log(`GLaDOS 云端签到开始：${accounts.length} 个账号`);
+              const seen = new Set();
+              const totals = { new: 0, already: 0, recorded: 0, failed: 0 };
+              for (const [index, account] of accounts.entries()) {
+                const [kind, message] = await checkAccount(browser, account, seen);
+                totals[kind] += 1;
+                console.log(`[账号${index + 1}] ${message}`);
+              }
+              console.log(`新签到 ${totals.new}，今日已签到 ${totals.already}，今日已记录 ${totals.recorded}，失败 ${totals.failed}`);
+              process.exitCode = totals.failed ? 1 : 0;
+            } finally {
+              await browser?.close().catch(() => {});
+              if (chrome.exitCode === null) chrome.kill();
+              await rm(profile, { recursive: true, force: true }).catch(() => {});
+            }
+          }
+
+          main().catch(() => {
+            console.error('云端 Chrome 启动或连接失败。');
+            process.exitCode = 1;
+          });
+          NODE
